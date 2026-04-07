@@ -1,16 +1,26 @@
 import express from "express";
+import type { Request, Response } from "express";
 import fs from "node:fs";
 import path from "node:path";
 import cors from "cors";
 import crypto from "node:crypto";
 import { verifyToken } from "./firebase/auth.js";
-import Upload from "./s3/buket.js";
-import { ListUserFiles, DeleteUserFile } from "./s3/buket.js";
+import Upload, {
+  ListUserFiles,
+  DeleteUserFile,
+  GetUserFile,
+} from "./s3/buket.js";
+import { prisma } from "./db/prisma.js";
+
+// Define a custom request type for Firebase Auth
+interface AuthRequest extends Request {
+  user?: { uid: string };
+}
+
 const app = express();
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 const TEMP_DIR = path.join(UPLOAD_DIR, "temp");
 
-// Ensure directories exist
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
@@ -27,33 +37,30 @@ app.use(
   }),
 );
 
-// 1. GET: Byte Serving Route
-app.get("/files/:filename", (req, res) => {
+// 1. GET: Byte Serving
+app.get("/files/:filename", (req: Request, res: Response) => {
   try {
     const filePath = path.join(UPLOAD_DIR, path.basename(req.params.filename));
     if (!fs.existsSync(filePath)) return res.status(404).send("File not found");
 
     const stat = fs.statSync(filePath);
-    const fileSize = stat.size;
     const range = req.headers.range;
 
     if (range) {
       const parts = range.replace(/bytes=/, "").split("-");
       const start = parseInt(parts[0], 10);
-      const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+      const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
       const chunksize = end - start + 1;
-      const file = fs.createReadStream(filePath, { start, end });
-
       res.writeHead(206, {
-        "Content-Range": `bytes ${start}-${end}/${fileSize}`,
+        "Content-Range": `bytes ${start}-${end}/${stat.size}`,
         "Accept-Ranges": "bytes",
         "Content-Length": chunksize,
         "Content-Type": "application/octet-stream",
       });
-      file.pipe(res);
+      fs.createReadStream(filePath, { start, end }).pipe(res);
     } else {
       res.writeHead(200, {
-        "Content-Length": fileSize,
+        "Content-Length": stat.size,
         "Content-Type": "application/octet-stream",
       });
       fs.createReadStream(filePath).pipe(res);
@@ -63,150 +70,186 @@ app.get("/files/:filename", (req, res) => {
   }
 });
 
-// 2. POST: Initialize Upload
-app.post("/upload/init", (req, res) => {
-  try {
-    const uploadId = crypto.randomUUID();
-    console.log("✅ Init upload:", uploadId);
-    res.json({ uploadId });
-  } catch (error) {
-    console.error("❌ Error initializing upload:", error);
-    res.status(500).json({ error: "Failed to initialize upload" });
-  }
+// 2. POST: Init
+app.post("/upload/init", (req: Request, res: Response) => {
+  res.json({ uploadId: crypto.randomUUID() });
 });
 
-// 3. POST: Upload Chunk
+// 3. POST: Chunk
 app.post(
   "/upload/chunk",
   verifyToken,
   express.raw({ type: "application/octet-stream", limit: "10mb" }),
-  (req, res) => {
+  (req: AuthRequest, res: Response) => {
     try {
-      const { "x-upload-id": uploadId, "content-range": range } = req.headers;
+      const uploadId = req.headers["x-upload-id"] as string;
+      const range = req.headers["content-range"] as string;
       const match = range?.match(/bytes (\d+)-/);
 
-      if (!uploadId || !match) {
+      if (!uploadId || !match)
         return res.status(400).json({ error: "Invalid headers" });
-      }
 
-      const chunkDir = path.join(TEMP_DIR, uploadId as string);
-      if (!fs.existsSync(chunkDir)) {
-        fs.mkdirSync(chunkDir, { recursive: true });
-      }
+      const chunkDir = path.join(TEMP_DIR, path.basename(uploadId));
+      if (!fs.existsSync(chunkDir)) fs.mkdirSync(chunkDir, { recursive: true });
 
-      const chunkPath = path.join(chunkDir, `chunk-${match[1]}`);
-      fs.writeFileSync(chunkPath, req.body);
-
+      fs.writeFileSync(path.join(chunkDir, `chunk-${match[1]}`), req.body);
       res.sendStatus(200);
     } catch (error) {
-      res.status(500).json({ error: "Failed to upload chunk" });
+      res.status(500).json({ error: "Chunk failed" });
     }
   },
 );
 
-// 4. POST: Complete & Assemble
-app.post("/upload/complete", express.json(), verifyToken, async (req, res) => {
-  try {
-    const { uploadId, fileName } = req.body;
+// 4. POST: Complete
+app.post(
+  "/upload/complete",
+  express.json(),
+  verifyToken,
+  async (req: AuthRequest, res: Response) => {
+    const { uploadId, fileName, downloadLimit = 5 } = req.body;
+    const userId = req.user?.uid;
 
-    if (!uploadId || !fileName) {
-      return res.status(400).json({ error: "Missing uploadId or fileName" });
-    }
+    if (!uploadId || !fileName || !userId)
+      return res.status(400).json({ error: "Missing data" });
 
-    const chunkDir = path.join(TEMP_DIR, uploadId);
+    const chunkDir = path.join(TEMP_DIR, path.basename(uploadId));
     const safeName = path.basename(fileName);
-    const finalPath = path.join(UPLOAD_DIR, safeName);
+    const finalPath = path.join(
+      UPLOAD_DIR,
+      `${crypto.randomUUID()}-${safeName}`,
+    );
 
-    if (!fs.existsSync(chunkDir)) {
-      return res.status(400).json({ error: "Upload not found" });
-    }
+    try {
+      if (!fs.existsSync(chunkDir)) throw new Error("Upload directory missing");
 
-    const allFiles = fs.readdirSync(chunkDir);
+      const chunks = fs
+        .readdirSync(chunkDir)
+        .sort((a, b) => parseInt(a.split("-")[1]) - parseInt(b.split("-")[1]));
 
-    const chunks = allFiles
-      .filter((f) => f.startsWith("chunk-"))
-      .sort((a, b) => {
-        const aNum = parseInt(a.split("-")[1], 10);
-        const bNum = parseInt(b.split("-")[1], 10);
-        return aNum - bNum;
-      });
-
-    if (chunks.length === 0) {
-      return res.status(400).json({ error: "No chunks found" });
-    }
-
-    const writeStream = fs.createWriteStream(finalPath);
-    let totalBytes = 0;
-
-    for (const chunk of chunks) {
-      const chunkPath = path.join(chunkDir, chunk);
-
-      const data = fs.readFileSync(chunkPath);
-      totalBytes += data.length;
-
-      const canWrite = writeStream.write(data);
-      if (!canWrite) {
-        await new Promise((resolve) => writeStream.once("drain", resolve));
+      const writeStream = fs.createWriteStream(finalPath);
+      for (const chunk of chunks) {
+        writeStream.write(fs.readFileSync(path.join(chunkDir, chunk)));
       }
+      writeStream.end();
 
-      fs.unlinkSync(chunkPath);
+      await new Promise((resolve) => writeStream.on("finish", resolve));
+
+      const fileSize = fs.statSync(finalPath).size;
+      const fileKey = `${userId}/${safeName}`;
+
+      await Upload(userId, safeName, finalPath);
+
+      await prisma.file.upsert({
+        where: { fileKey },
+        update: {
+          downloadLimit: Number(downloadLimit),
+          downloadCount: 0,
+          size: fileSize,
+        },
+        create: {
+          userId,
+          fileName: safeName,
+          fileKey,
+          size: fileSize,
+          downloadLimit: Number(downloadLimit),
+          downloadCount: 0,
+        },
+      });
+
+      res.json({ message: "Complete", fileName: safeName });
+    } catch (error: any) {
+      res.status(500).json({ error: error.message });
+    } finally {
+      if (fs.existsSync(finalPath)) fs.unlinkSync(finalPath);
+      if (fs.existsSync(chunkDir))
+        fs.rmSync(chunkDir, { recursive: true, force: true });
     }
+  },
+);
 
-    await new Promise<void>((resolve, reject) => {
-      writeStream.end(() => {
-        resolve();
-      });
-      writeStream.on("error", (err) => {
-        reject(err);
-      });
-    });
-
-    // Inside /upload/complete, replace the Upload() call with:
-    const userId = (req as any).user.uid;
-    Upload(userId, safeName, finalPath)
-      .then(() => {
-        fs.unlinkSync(finalPath); // 👈 delete local file after successful S3 upload
-        console.log(`🗑️ Deleted local file: ${safeName}`);
-      })
-      .catch((e) => {
-        console.log(`error ${e}`);
-      });
-
-    fs.rmdirSync(chunkDir);
-
-    res.json({
-      message: "Complete",
-      url: `/files/${safeName}`,
-      fileName: safeName,
-    });
-  } catch (error) {
-    res.status(500).json({
-      error: "Failed to complete upload",
-      details: (error as Error).message,
-    });
-  }
-});
-app.get("/files", verifyToken, async (req, res) => {
+// 5. GET: List
+app.get("/files", verifyToken, async (req: AuthRequest, res: Response) => {
   try {
-    const userId = (req as any).user.uid; // uid attached by verifyToken middleware
-    const files = await ListUserFiles(userId);
+    const userId = req.user!.uid;
+    const [r2Files, dbFiles] = await Promise.all([
+      ListUserFiles(userId),
+      prisma.file.findMany({ where: { userId } }),
+    ]);
+
+    const dbMap = new Map(dbFiles.map((f) => [f.fileKey, f]));
+    const files = r2Files.map((f) => {
+      const db = dbMap.get(f.key as string);
+      return {
+        ...f,
+        downloadLimit: db?.downloadLimit ?? 5,
+        downloadCount: db?.downloadCount ?? 0,
+      };
+    });
+
     res.json({ files });
   } catch (error) {
-    console.error("❌ Error listing files:", error);
-    res.status(500).json({ error: "Failed to list files" });
+    res.status(500).json({ error: "List failed" });
   }
 });
-app.delete("/files/:fileName", verifyToken, async (req, res) => {
+
+// 6. DELETE
+app.delete(
+  "/files/:fileName",
+  verifyToken,
+  async (req: AuthRequest, res: Response) => {
+    try {
+      const userId = req.user!.uid;
+      const name = decodeURIComponent(req.params.fileName);
+      await Promise.all([
+        DeleteUserFile(userId, name),
+        prisma.file.deleteMany({ where: { fileKey: `${userId}/${name}` } }),
+      ]);
+      res.json({ message: "Deleted" });
+    } catch (error) {
+      res.status(500).json({ error: "Delete failed" });
+    }
+  },
+);
+
+// 7. GET: Download
+app.get("/download/:userId/:fileName", async (req: Request, res: Response) => {
   try {
-    const userId = (req as any).user.uid;
-    const fileName = decodeURIComponent(req.params.fileName);
+    const { userId, fileName } = req.params;
+    const decoded = decodeURIComponent(fileName);
+    const fileKey = `${userId}/${decoded}`;
 
-    await DeleteUserFile(userId, fileName);
+    const record = await prisma.file.findUnique({ where: { fileKey } });
+    if (!record) return res.status(404).send("Not found");
 
-    res.json({ message: "File deleted successfully" });
+    if (
+      record.downloadLimit > 0 &&
+      record.downloadCount >= record.downloadLimit
+    ) {
+      return res.status(410).send("Limit reached");
+    }
+
+    const stream = await GetUserFile(userId, decoded);
+    res.setHeader("Content-Disposition", `attachment; filename="${decoded}"`);
+
+    if (
+      record.downloadLimit > 0 &&
+      record.downloadCount + 1 >= record.downloadLimit
+    ) {
+      await Promise.all([
+        DeleteUserFile(userId, decoded),
+        prisma.file.delete({ where: { fileKey } }),
+      ]);
+    } else {
+      await prisma.file.update({
+        where: { fileKey },
+        data: { downloadCount: { increment: 1 } },
+      });
+    }
+
+    stream.pipe(res);
   } catch (error) {
-    console.error("❌ Error deleting file:", error);
-    res.status(500).json({ error: "Failed to delete file" });
+    res.status(500).send("Download failed");
   }
 });
+
 app.listen(3000, () => console.log("🚀 Server running on port 3000"));

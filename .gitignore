@@ -1,3 +1,5 @@
 node_modules
 firebase/auth.json
 .env
+
+/generated/prisma
