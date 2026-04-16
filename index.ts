@@ -1,3 +1,4 @@
+import "dotenv/config";
 import express from "express";
 import type { Request, Response } from "express";
 import fs from "node:fs";
@@ -10,9 +11,12 @@ import Upload, {
   DeleteUserFile,
   GetUserFile,
 } from "./s3/buket.js";
-import { prisma } from "./db/prisma.js";
 
-// Define a custom request type for Firebase Auth
+// Drizzle Imports
+import { db } from "./db/db.js";
+import { files as filesTable } from "./db/schema.js";
+import { eq, and, sql as drizzleSql } from "drizzle-orm";
+
 interface AuthRequest extends Request {
   user?: { uid: string };
 }
@@ -21,7 +25,7 @@ const app = express();
 const UPLOAD_DIR = path.join(process.cwd(), "uploads");
 const TEMP_DIR = path.join(UPLOAD_DIR, "temp");
 
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 if (!fs.existsSync(TEMP_DIR)) fs.mkdirSync(TEMP_DIR, { recursive: true });
 
 app.use(
@@ -50,11 +54,10 @@ app.get("/files/:filename", (req: Request, res: Response) => {
       const parts = range.replace(/bytes=/, "").split("-");
       const start = parseInt(parts[0], 10);
       const end = parts[1] ? parseInt(parts[1], 10) : stat.size - 1;
-      const chunksize = end - start + 1;
       res.writeHead(206, {
         "Content-Range": `bytes ${start}-${end}/${stat.size}`,
         "Accept-Ranges": "bytes",
-        "Content-Length": chunksize,
+        "Content-Length": end - start + 1,
         "Content-Type": "application/octet-stream",
       });
       fs.createReadStream(filePath, { start, end }).pipe(res);
@@ -100,7 +103,7 @@ app.post(
   },
 );
 
-// 4. POST: Complete
+// 4. POST: Complete (Drizzle UPSERT)
 app.post(
   "/upload/complete",
   express.json(),
@@ -125,7 +128,6 @@ app.post(
       const chunks = fs
         .readdirSync(chunkDir)
         .sort((a, b) => parseInt(a.split("-")[1]) - parseInt(b.split("-")[1]));
-
       const writeStream = fs.createWriteStream(finalPath);
       for (const chunk of chunks) {
         writeStream.write(fs.readFileSync(path.join(chunkDir, chunk)));
@@ -133,28 +135,30 @@ app.post(
       writeStream.end();
 
       await new Promise((resolve) => writeStream.on("finish", resolve));
-
       const fileSize = fs.statSync(finalPath).size;
       const fileKey = `${userId}/${safeName}`;
 
       await Upload(userId, safeName, finalPath);
 
-      await prisma.file.upsert({
-        where: { fileKey },
-        update: {
-          downloadLimit: Number(downloadLimit),
-          downloadCount: 0,
-          size: fileSize,
-        },
-        create: {
+      await db
+        .insert(filesTable)
+        .values({
+          id: crypto.randomUUID(),
           userId,
           fileName: safeName,
           fileKey,
           size: fileSize,
           downloadLimit: Number(downloadLimit),
           downloadCount: 0,
-        },
-      });
+        })
+        .onConflictDoUpdate({
+          target: filesTable.fileKey,
+          set: {
+            size: fileSize,
+            downloadLimit: Number(downloadLimit),
+            downloadCount: 0,
+          },
+        });
 
       res.json({ message: "Complete", fileName: safeName });
     } catch (error: any) {
@@ -171,18 +175,23 @@ app.post(
 app.get("/files", verifyToken, async (req: AuthRequest, res: Response) => {
   try {
     const userId = req.user!.uid;
+
     const [r2Files, dbFiles] = await Promise.all([
-      ListUserFiles(userId),
-      prisma.file.findMany({ where: { userId } }),
+      ListUserFiles(userId).catch(() => []),
+      db
+        .select()
+        .from(filesTable)
+        .where(eq(filesTable.userId, userId))
+        .catch(() => []),
     ]);
 
     const dbMap = new Map(dbFiles.map((f) => [f.fileKey, f]));
     const files = r2Files.map((f) => {
-      const db = dbMap.get(f.key as string);
+      const dbEntry = dbMap.get(f.key as string);
       return {
         ...f,
-        downloadLimit: db?.downloadLimit ?? 5,
-        downloadCount: db?.downloadCount ?? 0,
+        downloadLimit: dbEntry?.downloadLimit ?? 5,
+        downloadCount: dbEntry?.downloadCount ?? 0,
       };
     });
 
@@ -200,9 +209,15 @@ app.delete(
     try {
       const userId = req.user!.uid;
       const name = decodeURIComponent(req.params.fileName);
+      const fileKey = `${userId}/${name}`;
+
+      // Use catch on individuals to prevent Promise.all from crashing if one is already gone
       await Promise.all([
-        DeleteUserFile(userId, name),
-        prisma.file.deleteMany({ where: { fileKey: `${userId}/${name}` } }),
+        DeleteUserFile(userId, name).catch(() => null),
+        db
+          .delete(filesTable)
+          .where(eq(filesTable.fileKey, fileKey))
+          .catch(() => null),
       ]);
       res.json({ message: "Deleted" });
     } catch (error) {
@@ -218,7 +233,12 @@ app.get("/download/:userId/:fileName", async (req: Request, res: Response) => {
     const decoded = decodeURIComponent(fileName);
     const fileKey = `${userId}/${decoded}`;
 
-    const record = await prisma.file.findUnique({ where: { fileKey } });
+    const [record] = await db
+      .select()
+      .from(filesTable)
+      .where(eq(filesTable.fileKey, fileKey))
+      .limit(1);
+
     if (!record) return res.status(404).send("Not found");
 
     if (
@@ -231,25 +251,35 @@ app.get("/download/:userId/:fileName", async (req: Request, res: Response) => {
     const stream = await GetUserFile(userId, decoded);
     res.setHeader("Content-Disposition", `attachment; filename="${decoded}"`);
 
-    if (
-      record.downloadLimit > 0 &&
-      record.downloadCount + 1 >= record.downloadLimit
-    ) {
-      await Promise.all([
-        DeleteUserFile(userId, decoded),
-        prisma.file.delete({ where: { fileKey } }),
-      ]);
-    } else {
-      await prisma.file.update({
-        where: { fileKey },
-        data: { downloadCount: { increment: 1 } },
-      });
-    }
+    // We process the logic but don't 'await' it to block the stream if not necessary
+    // This prevents "Header already sent" or timeout errors during file pipe
+    const handleCleanup = async () => {
+      if (
+        record.downloadLimit > 0 &&
+        record.downloadCount + 1 >= record.downloadLimit
+      ) {
+        await Promise.all([
+          DeleteUserFile(userId, decoded).catch(() => null),
+          db
+            .delete(filesTable)
+            .where(eq(filesTable.fileKey, fileKey))
+            .catch(() => null),
+        ]);
+      } else {
+        await db
+          .update(filesTable)
+          .set({ downloadCount: record.downloadCount + 1 })
+          .where(eq(filesTable.fileKey, fileKey))
+          .catch(() => null);
+      }
+    };
 
+    handleCleanup();
     stream.pipe(res);
   } catch (error) {
     res.status(500).send("Download failed");
   }
 });
 
-app.listen(3000, () => console.log("🚀 Server running on port 3000"));
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));

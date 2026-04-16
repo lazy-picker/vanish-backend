@@ -28,6 +28,8 @@
     "@prisma/extension-accelerate": "^3.0.1",
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
+    "drizzle-kit": "^0.31.10",
+    "drizzle-orm": "^0.45.2",
     "firebase-admin": "^13.6.1",
     "pg": "^8.20.0",
     "prisma": "^7.6.0"
